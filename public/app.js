@@ -281,11 +281,12 @@ async function route() {
     try {
       const r = await api('GET', '/auth/me');
       S.me = r.user; S.settings = r.settings;
-      S.cur = await api('GET', '/currencies');
     } catch {
       const st = await api('GET', '/setup').catch(() => ({}));
       return st.needsSetup ? renderSetup(root) : renderLogin(root);
     }
+    // Only a failed /auth/me means "signed out"; anything else just falls back to defaults.
+    S.cur = await api('GET', '/currencies').catch(() => ({ base: S.settings.currency || 'INR', rates: [] }));
   }
   let page = parts[0] || 'dashboard';
   if (S.me.must_change_password) page = 'account';
