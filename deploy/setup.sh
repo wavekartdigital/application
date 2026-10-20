@@ -1,19 +1,32 @@
 #!/usr/bin/env bash
-# One-time (and re-runnable) server setup for Agency Vault on Ubuntu 22.04 / 24.04.
-#   Usage (as root, with the app already copied to /opt/agency-vault):
-#     bash /opt/agency-vault/deploy/setup.sh vault.yourdomain.com   # HTTPS on your domain (recommended)
-#     bash /opt/agency-vault/deploy/setup.sh                        # plain HTTP on the server IP (testing only)
+# Install or update Agency Vault on Ubuntu 22.04 / 24.04. Safe to run again: it pulls the latest code and restarts.
+#   As root on the server:
+#     curl -fsSL https://raw.githubusercontent.com/wavekartdigital/application/main/deploy/setup.sh | bash -s -- vault.yourdomain.com
+#   Without a domain (plain HTTP on the server IP, testing only):
+#     curl -fsSL https://raw.githubusercontent.com/wavekartdigital/application/main/deploy/setup.sh | bash
 set -euo pipefail
 
 DOMAIN="${1:-}"
 APP_DIR=/opt/agency-vault
+REPO=https://github.com/wavekartdigital/application.git
 
 [ "$(id -u)" = 0 ] || { echo "Please run as root (or with sudo)."; exit 1; }
-[ -f "$APP_DIR/package.json" ] || { echo "App not found in $APP_DIR. Copy it there first."; exit 1; }
 export DEBIAN_FRONTEND=noninteractive
 
 echo "==> Installing system packages"
 apt-get update -y
+apt-get install -y git curl
+
+echo "==> Getting the latest app code"
+if [ -d "$APP_DIR/.git" ]; then
+  git -C "$APP_DIR" pull --ff-only
+elif [ -f "$APP_DIR/package.json" ]; then
+  echo "Using the app already copied to $APP_DIR"
+else
+  mkdir -p "$APP_DIR"
+  git clone "$REPO" "$APP_DIR.tmp"
+  cp -a "$APP_DIR.tmp/." "$APP_DIR/" && rm -rf "$APP_DIR.tmp"   # keeps a data/ folder you may have uploaded first
+fi
 if ! command -v node >/dev/null || [ "$(node -p 'process.versions.node.split(".")[0]')" -lt 20 ]; then
   curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
   apt-get install -y nodejs
