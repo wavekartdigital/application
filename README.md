@@ -12,7 +12,28 @@ A small, self-hosted admin app for agencies that manage many client websites. It
 - **Timeline**: comments, commercials/deals (with value), new approaches/ideas, meetings, issues, updates
 - Billing: invoices, payments and expenses, profit per website
 
-**Owner dashboard**: MRR/ARR, revenue this month/year, expenses, outstanding and overdue invoices, a revenue vs expenses chart, a website growth chart (onboarded vs exited), billing due, renewals, tasks due, follow-ups, latest deals and ideas, team workload and top websites by revenue.
+**Owner dashboard**: MRR/ARR, revenue, expenses and profit (this month and this year), outstanding and overdue invoices, a revenue vs expenses chart, a website growth chart (onboarded vs exited), payroll and unpaid payslips, freelance balances, domain/SSL/hosting expiries and margin, where the money goes (expenses by category), revenue by currency, billing due, renewals, tasks due, follow-ups, latest deals and ideas, team workload and top websites by revenue.
+
+**Multi-currency**
+- Set a base currency plus exchange rates (Company settings → Currencies)
+- Clients, websites, invoices, payments, salaries, freelance jobs and procurement items each have their own currency
+- Every payment stores its base-currency value at the rate in effect when it was recorded, so reports add up correctly
+
+**Employees & payroll** (permission: "Employees, salaries, payslips & freelancers")
+- **Official name** (real/legal, used on payslips) and **display name** (the masked/working name). People without HR access only ever see display names.
+- Employee code, designation, department, type (full-time, part-time, contract, intern, freelancer), joining and exit dates, optional link to an app login
+- Bank and ID details are encrypted and only shown on request (logged)
+- Monthly salary structure: earnings and deductions
+- **Payslips**: generate a whole month in one click, pro-rated by paid days; edit; print or save as PDF; mark as paid (records a "Salary" expense)
+- **Benefits**: health/life insurance, PF, gratuity, bonus, allowances, leave, equipment, training
+
+**Freelance work**: jobs given to freelancers with agreed amount, currency, due date and status. Record full or partial payouts (each becomes an expense on that website) and see balances still to pay.
+
+**Domains, SSL, hosting & more (procurement)**: domains, SSL, hosting, email, servers, CDN, licences, SaaS, backup and maintenance plans, with vendor, vendor account, purchase and expiry dates, renewal cycle, auto-renew, our cost vs client price and margin. Renew in one click (moves the expiry forward, records the cost, drafts the client invoice). Expiries show on the dashboard.
+
+**Services catalog**: your price list of add-on services, which you can pick straight into invoices.
+
+**CSV exports**: payments, invoices, procurement, freelance jobs and payslips.
 
 **Clients & onboarding**
 - Client records with billing details, websites, invoices, payments and follow-ups

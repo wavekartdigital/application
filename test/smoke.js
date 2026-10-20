@@ -104,6 +104,81 @@ function client(base) {
     await pub('GET', `/public/onboard/${onb.token}`, null, 404);
     assert.strictEqual((await owner('GET', `/websites/${onb.website_id}`)).website.status, 'active');
 
+    // ---- multi-currency ----
+    await owner('PUT', '/currencies/USD', { rate: 83 });
+    const { id: usClient } = await owner('POST', '/clients', { name: 'US Corp', currency: 'USD' });
+    const usInv = await owner('POST', '/invoices', { client_id: usClient, items: [{ description: 'Retainer', qty: 1, rate: 100 }], tax_rate: 0 });
+    const usInvD = (await owner('GET', `/invoices/${usInv.id}`)).invoice;
+    assert.strictEqual(usInvD.currency, 'USD');
+    assert.strictEqual(usInvD.exchange_rate, 83);
+    await owner('POST', `/invoices/${usInv.id}/pay`, {});
+    const usPay = (await owner('GET', '/payments')).find((p) => p.invoice_id === usInv.id);
+    assert.strictEqual(usPay.amount, 100);
+    assert.strictEqual(usPay.amount_base, 8300);
+    await owner('POST', '/invoices', { currency: 'JPY', items: [] }, 400); // no rate set for JPY
+
+    // ---- employees, masking, payslips ----
+    const { id: empId } = await owner('POST', '/employees', {
+      official_name: 'Rakesh Kumar Verma', display_name: 'Ricky', employment_type: 'full_time', bank_details: 'HDFC 1234',
+      salary_structure: { earnings: [{ name: 'Basic', amount: 20000 }, { name: 'HRA', amount: 10000 }], deductions: [{ name: 'PF', amount: 1800 }] },
+    });
+    const emp = (await owner('GET', `/employees/${empId}`)).employee;
+    assert.strictEqual(emp.salary_structure.net, 28200);
+    assert.strictEqual(emp.bank_enc, undefined);
+    assert.strictEqual((await owner('POST', `/employees/${empId}/reveal`)).bank_details, 'HDFC 1234');
+    await owner('POST', `/employees/${empId}/benefits`, { type: 'health_insurance', title: 'Family floater', amount: 12000, frequency: 'yearly' });
+    const gen = await owner('POST', '/payslips/generate', { month: '2026-09', working_days: 30 });
+    assert.strictEqual(gen.created, 1);
+    assert.strictEqual((await owner('POST', '/payslips/generate', { month: '2026-09' })).created, 0, 'no duplicates');
+    const slip = (await owner('GET', '/payslips?month=2026-09'))[0];
+    await owner('PUT', `/payslips/${slip.id}`, { paid_days: 15, recalculate: true });
+    const slip2 = (await owner('GET', `/payslips/${slip.id}`)).payslip;
+    assert.strictEqual(slip2.gross, 15000);
+    assert.strictEqual(slip2.net, 13200);
+    await owner('POST', `/payslips/${slip.id}/pay`, { method: 'Bank' });
+    const salaryPay = (await owner('GET', '/payments?type=expense')).find((p) => p.source === 'payslip');
+    assert.strictEqual(salaryPay.amount, 13200);
+    await owner('PUT', `/payslips/${slip.id}`, { paid_days: 30 }, 400); // paid slips are locked
+
+    const viewer = await owner('POST', '/users', { name: 'Val Viewer', email: 'val@test.local', role: 'viewer' });
+    const val = client(base);
+    await val('POST', '/auth/login', { email: 'val@test.local', password: viewer.temp_password });
+    await val('PUT', '/account/password', { current_password: viewer.temp_password, new_password: 'valpass123' });
+    await val('GET', '/employees', null, 403);
+    const dir = await val('GET', '/employees/directory');
+    assert.strictEqual(dir[0].name, 'Ricky');
+    assert.strictEqual(dir[0].official_name, undefined, 'real name is masked for non-HR');
+    await val('GET', '/export/payments.csv', null, 403);
+
+    // ---- freelance ----
+    const { id: flId } = await owner('POST', '/freelance', { freelancer_name: 'Asha (Fiverr)', title: 'Logo design', amount: 5000, website_id: siteId });
+    await owner('POST', `/freelance/${flId}/pay`, { amount: 2000 });
+    let job = (await owner('GET', '/freelance')).find((j) => j.id === flId);
+    assert.strictEqual(job.balance, 3000);
+    assert.notStrictEqual(job.status, 'paid');
+    await owner('POST', `/freelance/${flId}/pay`, {});
+    job = (await owner('GET', '/freelance')).find((j) => j.id === flId);
+    assert.strictEqual(job.status, 'paid');
+
+    // ---- procurement ----
+    const proc = await owner('POST', '/procurements', { website_id: siteId, type: 'domain', item: 'acme.com', vendor: 'GoDaddy', billing_cycle: 'yearly', purchase_date: '2025-11-01', cost: 800, price: 1500, record_expense: true });
+    assert.strictEqual((await owner('GET', `/procurements?website_id=${siteId}`)).items[0].expiry_date, '2026-11-01');
+    const ren = await owner('POST', `/procurements/${proc.id}/renew`, { record_expense: true, create_invoice: true });
+    assert.strictEqual(ren.expiry_date, '2027-11-01');
+    assert.ok(ren.invoice.number);
+    const dash2 = await owner('GET', '/dashboard');
+    assert.strictEqual(dash2.procurement.active, 1);
+    assert.strictEqual(dash2.procurement.annual_margin, 700);
+    assert.strictEqual(dash2.hr.headcount, 1);
+    assert.strictEqual(dash2.freelance.open_jobs, 0);
+    assert.ok(dash2.expense_breakdown.some((e) => e.label === 'Salary'));
+
+    // ---- catalog & export ----
+    await owner('POST', '/catalog', { name: 'Wildcard SSL', category: 'ssl', price: 9000, cost: 6000, billing_cycle: 'yearly' });
+    assert.strictEqual((await val('GET', '/catalog'))[0].cost, undefined);
+    const csv = await fetch(base + '/api/export/payments.csv', { headers: { cookie: '' } });
+    assert.strictEqual(csv.status, 401);
+
     // CSRF header required
     const r = await fetch(base + '/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
     assert.strictEqual(r.status, 403);

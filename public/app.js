@@ -6,7 +6,7 @@ const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const h = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const todayStr = () => new Date().toLocaleDateString('en-CA');
-const S = { me: null, settings: {}, users: null };
+const S = { me: null, settings: {}, users: null, cur: { base: 'INR', rates: [] } };
 const can = (p) => !!(S.me && S.me.perms[p]);
 const isAdmin = () => ['owner', 'admin'].includes(S.me?.role);
 let uid = 0;
@@ -41,11 +41,19 @@ async function copy(text, label = 'Copied') {
 }
 
 // ---------- formatting ----------
-function money(n) {
+function money(n, cur) {
+  const c = cur || S.settings.currency || 'INR';
   try {
-    return new Intl.NumberFormat(undefined, { style: 'currency', currency: S.settings.currency || 'INR', maximumFractionDigits: 2 }).format(n || 0);
-  } catch { return (S.settings.currency || '') + ' ' + Number(n || 0).toFixed(2); }
+    return new Intl.NumberFormat(undefined, { style: 'currency', currency: c, maximumFractionDigits: 2 }).format(n || 0);
+  } catch { return c + ' ' + Number(n || 0).toFixed(2); }
 }
+// Amount in its own currency, plus the base-currency equivalent when they differ.
+function moneyDual(amount, cur, base) {
+  if (!cur || cur === (S.settings.currency || 'INR') || base === undefined || base === null) return money(amount, cur);
+  return `${money(amount, cur)} <span class="muted small">≈ ${money(base)}</span>`;
+}
+const currencyOptions = () => [[S.cur.base, S.cur.base + ' (base)'], ...S.cur.rates.map((r) => [r.code, r.code])];
+const currencyField = (name = 'currency', label = 'Currency', empty) => ({ name, label, type: 'select', options: [...(empty ? [['', empty]] : []), ...currencyOptions()] });
 const compact = (n) => new Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 1 }).format(n || 0);
 function fmtDate(d) {
   if (!d) return '—';
@@ -84,6 +92,7 @@ const PERM_LABEL = {
   clients_manage: 'Manage clients, onboarding & follow-ups',
   tasks_manage: "Assign & manage everyone's tasks",
   users_manage: 'Manage team members',
+  hr_manage: 'Employees, salaries, payslips & freelancers',
 };
 const ONBOARD_ITEMS = [
   ['Hosting / cPanel login', 'hosting'], ['Domain registrar login', 'domain'], ['Business email access', 'email'],
@@ -253,6 +262,9 @@ const NAV = [
   ['onboarding', 'Client onboarding', () => can('clients_manage')],
   ['followups', 'Follow-ups', () => can('clients_manage') || can('finance_edit')],
   ['finance', 'Finance & invoices', () => can('finance_view')],
+  ['procurement', 'Domains, SSL & hosting', () => can('websites_edit') || can('finance_view')],
+  ['freelance', 'Freelance work', () => can('hr_manage') || can('finance_edit')],
+  ['employees', 'Employees & payroll', () => can('hr_manage')],
   ['-'],
   ['team', 'Team & roles', () => can('users_manage')],
   ['settings', 'Company settings', isAdmin],
@@ -269,6 +281,7 @@ async function route() {
     try {
       const r = await api('GET', '/auth/me');
       S.me = r.user; S.settings = r.settings;
+      S.cur = await api('GET', '/currencies');
     } catch {
       const st = await api('GET', '/setup').catch(() => ({}));
       return st.needsSetup ? renderSetup(root) : renderLogin(root);
@@ -277,7 +290,7 @@ async function route() {
   let page = parts[0] || 'dashboard';
   if (S.me.must_change_password) page = 'account';
   if (!PAGES[page]) page = 'dashboard';
-  const navItem = NAV.find((n) => n[0] === page || (page === 'website' && n[0] === 'websites') || (page === 'client' && n[0] === 'clients') || (page === 'invoice' && n[0] === 'finance'));
+  const navItem = NAV.find((n) => n[0] === page || (page === 'website' && n[0] === 'websites') || (page === 'client' && n[0] === 'clients') || (page === 'invoice' && n[0] === 'finance') || ((page === 'employee' || page === 'payslip') && n[0] === 'employees'));
   if (navItem && navItem[2] && !navItem[2]()) page = 'dashboard';
   renderShell(root, navItem ? navItem[0] : page);
   const main = $('#main');
@@ -381,21 +394,26 @@ PAGES.dashboard = async (m) => {
     kpi('Active websites', d.counts.active, `${d.counts.onboarding} onboarding · ${d.counts.paused} paused · ${d.counts.exited} exited`),
     F && kpi('Monthly recurring (MRR)', money(F.mrr), `ARR ${money(F.arr)}`),
     F && kpi('Revenue this month', money(F.revenue_month), change || `Last month ${money(F.revenue_last_month)}`),
-    F && kpi('Revenue this year', money(F.revenue_ytd), `Expenses this month ${money(F.expense_month)}`),
+    F && kpi('Profit this month', `<span class="${F.profit_month < 0 ? 'down' : ''}">${money(F.profit_month)}</span>`, `Expenses ${money(F.expense_month)}`),
+    F && kpi('Revenue this year', money(F.revenue_ytd), `Profit ${money(F.profit_ytd)} · expenses ${money(F.expense_ytd)}`),
     F && kpi('Outstanding invoices', money(F.outstanding.v), F.overdue.c ? `<span class="down">${F.overdue.c} overdue · ${money(F.overdue.v)}</span>` : `${F.outstanding.c} unpaid`),
     kpi('Tasks due this week', d.tasks.length, d.overdue_tasks ? `<span class="down">${d.overdue_tasks} overdue</span> · ${d.my_open_tasks} assigned to you` : `${d.my_open_tasks} assigned to you`),
+    d.hr && kpi('Team (employees)', d.hr.headcount, `Payroll ${money(d.hr.payroll_monthly)}/mo${d.hr.slips_pending ? ` · <a href="#/employees/payroll">${d.hr.slips_pending} unpaid payslip(s)</a>` : ''}`),
+    d.freelance && kpi('Freelance work', d.freelance.open_jobs + ' open', `To pay ${money(d.freelance.outstanding)} · paid this month ${money(d.freelance.paid_month)}`),
+    d.procurement && kpi('Domains, SSL & hosting', d.procurement.active + ' active', d.procurement.annual_margin !== undefined ? `Yearly margin ${money(d.procurement.annual_margin)}` : `${d.procurement.expiring.length} expiring in 30 days`),
     d.clients_active !== undefined && kpi('Active clients', d.clients_active, d.onboarding_submitted ? `<a href="#/onboarding">${d.onboarding_submitted} onboarding submission(s) to review</a>` : ''),
   ].filter(Boolean).join('');
 
   const months = (rows, map) => rows.map((r) => ({ label: monthLabel(r.month), full: new Date(r.month + '-01T00:00:00').toLocaleDateString(undefined, { month: 'long', year: 'numeric' }), ...map(r) }));
   const charts = `<div class="grid ${F ? 'g2' : ''}" style="margin-bottom:16px">
-    ${F ? `<div class="card"><h2>Revenue vs expenses · last 12 months</h2>${barChart(months(d.monthly, (r) => r), [{ key: 'income', label: 'Revenue', color: '--series-1' }, { key: 'expense', label: 'Expenses', color: '--series-2' }], money)}</div>` : ''}
+    ${F ? `<div class="card"><h2>Revenue vs expenses · last 12 months</h2>${barChart(months(d.monthly, (r) => r), [{ key: 'income', label: 'Revenue', color: '--series-1' }, { key: 'expense', label: 'Expenses', color: '--series-2' }], money)}<p class="small muted">All amounts converted to ${h(F.base_currency)}.</p></div>` : ''}
     <div class="card"><h2>Website growth · onboarded vs exited</h2>${barChart(months(d.growth, (r) => r), [{ key: 'onboarded', label: 'Onboarded', color: '--series-1' }, { key: 'exited', label: 'Exited', color: '--series-2' }], (n) => n, true)}</div></div>`;
 
   const list = (items, render, empty) => (items && items.length ? `<ul class="list">${items.map(render).join('')}</ul>` : `<div class="empty">${empty}</div>`);
   const cards = [];
   cards.push(`<div class="card"><h2>Tasks due (next 7 days)</h2>${list(d.tasks, (t) => `<li><div class="grow"><b>${h(t.title)}</b> ${t.frequency !== 'once' ? badge(t.frequency, FREQ[t.frequency]) : ''}<div class="muted small">${t.website_id ? `<a href="#/website/${t.website_id}/tasks">${h(t.website_name)}</a> · ` : ''}${h(t.assignee_name || 'Unassigned')}</div></div>${dueBadge(t.due_date)}<button class="sm" data-act="taskDone" data-id="${t.id}">Done</button></li>`, 'Nothing due. 🎉')}</div>`);
-  if (F) cards.push(`<div class="card"><h2>Billing due (next 7 days)</h2>${list(d.billing_due, (w) => `<li><div class="grow"><a href="#/website/${w.id}/billing"><b>${h(w.name)}</b></a><div class="muted small">${money(w.price)} · ${CYCLE[w.billing_cycle]}</div></div>${dueBadge(w.next_billing_date)}${can('finance_edit') ? `<button class="sm" data-act="planInvoice" data-id="${w.id}">Invoice</button>` : ''}</li>`, 'No recurring bills due.')}</div>`);
+  if (F) cards.push(`<div class="card"><h2>Billing due (next 7 days)</h2>${list(d.billing_due, (w) => `<li><div class="grow"><a href="#/website/${w.id}/billing"><b>${h(w.name)}</b></a><div class="muted small">${money(w.price, w.currency)} · ${CYCLE[w.billing_cycle]}</div></div>${dueBadge(w.next_billing_date)}${can('finance_edit') ? `<button class="sm" data-act="planInvoice" data-id="${w.id}">Invoice</button>` : ''}</li>`, 'No recurring bills due.')}</div>`);
+  if (d.procurement) cards.push(`<div class="card"><h2>Domains, SSL & hosting expiring (30 days)</h2>${list(d.procurement.expiring, (p) => `<li><div class="grow"><b>${h(p.item)}</b> ${badge('', p.type_label)}<div class="muted small">${p.website_id ? `<a href="#/website/${p.website_id}/services">${h(p.website_name)}</a>` : 'No website'}${p.vendor ? ' · ' + h(p.vendor) : ''}${p.price !== undefined && p.price ? ' · bill ' + money(p.price, p.price_currency) : ''}</div></div>${dueBadge(p.expiry_date)}${can('websites_edit') ? `<button class="sm" data-act="procRenew" data-id="${p.id}">Renew</button>` : ''}</li>`, 'Nothing expiring soon.')}</div>`);
   if (d.renewals) cards.push(`<div class="card"><h2>Renewals (domain, hosting… next 30 days)</h2>${list(d.renewals, (r) => `<li><div class="grow"><b>${h(r.label)}</b><div class="muted small"><a href="#/website/${r.website_id}/vault">${h(r.website_name)}</a> · ${h(CRED[r.category] || r.category)}${r.provider ? ' · ' + h(r.provider) : ''}${r.renewal_cost && F ? ' · ' + money(r.renewal_cost) : ''}</div></div>${dueBadge(r.renewal_date)}</li>`, 'No renewals coming up.')}</div>`);
   if (d.followups) cards.push(`<div class="card"><h2>Follow-ups</h2>${list(d.followups, (f) => `<li><div class="grow"><b>${h(f.subject)}</b><div class="muted small">${h(f.client_name || '')}${f.website_name ? ' · ' + h(f.website_name) : ''} · ${h(f.channel)}</div></div>${dueBadge(f.due_date)}<button class="sm" data-act="fuDone" data-id="${f.id}">Done</button></li>`, 'No pending follow-ups.')}</div>`);
   cards.push(`<div class="card"><h2>Latest updates, deals & ideas</h2>${list(d.recent_notes, (n) => `<li><div class="grow">${badge(n.type, NOTE[n.type])} <b>${h(n.title || '')}</b><div class="small pre">${h((n.body || '').slice(0, 160))}</div><div class="muted small"><a href="#/website/${n.website_id}/timeline">${h(n.website_name)}</a> · ${h(n.author_name || 'Client')} · ${fmtDate(n.created_at)}</div></div></li>`, 'No updates yet. Add comments, commercials or new approaches from a website’s Timeline tab.')}</div>`);
@@ -404,6 +422,12 @@ PAGES.dashboard = async (m) => {
   if (F) {
     const maxRev = Math.max(1, ...d.top_sites.map((x) => x.revenue));
     cards.push(`<div class="card"><h2>Top websites by revenue (12 months)</h2>${d.top_sites.length ? d.top_sites.map((x) => `<div class="bar-row"><div><a href="#/website/${x.id}">${h(x.name)}</a><div class="bar-track"><div class="bar-fill" style="width:${(x.revenue / maxRev) * 100}%"></div></div></div><div class="right small num">${money(x.revenue)}</div></div>`).join('') : '<div class="empty">No payments recorded yet.</div>'}</div>`);
+  }
+  if (F) {
+    const maxE = Math.max(1, ...d.expense_breakdown.map((x) => x.v));
+    cards.push(`<div class="card"><h2>Where the money goes (12 months)</h2>${d.expense_breakdown.length ? d.expense_breakdown.map((x) => `<div class="bar-row"><div><div>${h(x.label)}</div><div class="bar-track"><div class="bar-fill" style="width:${(x.v / maxE) * 100}%;background:var(--series-2)"></div></div></div><div class="right small num">${money(x.v)}</div></div>`).join('') : '<div class="empty">No expenses recorded.</div>'}</div>`);
+    if (d.revenue_by_currency.length > 1 || (d.revenue_by_currency[0] && d.revenue_by_currency[0].currency !== F.base_currency))
+      cards.push(`<div class="card"><h2>Revenue by currency (12 months)</h2><ul class="list">${d.revenue_by_currency.map((r) => `<li><div class="grow"><b>${h(r.currency)}</b><div class="muted small">≈ ${money(r.base)}</div></div><div class="num">${money(r.amount, r.currency)}</div></li>`).join('')}</ul></div>`);
   }
   m.innerHTML = pageHead(`Hello, ${h(S.me.name.split(' ')[0])}`, can('websites_edit') ? '<button class="primary" data-act="siteNew">+ Add website</button>' : '', new Date().toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }))
     + `<div class="kpis">${kpis}</div>${charts}<div class="grid g3">${cards.join('')}</div>`;
@@ -428,6 +452,7 @@ async function siteFields(site = {}) {
       { name: 'exit_reason', label: 'Exit reason', placeholder: 'Only if exited' },
       fin ? { type: 'html', full: true, html: '<h3 style="margin-top:6px">Pricing & billing</h3>' } : null,
       fin ? { name: 'billing_cycle', label: 'Billing cycle', type: 'select', options: enumOpts(CYCLE) } : null,
+      fin ? currencyField('currency', 'Billing currency', '— Same as client —') : null,
       fin ? { name: 'price', label: 'Price per cycle', type: 'number' } : null,
       fin ? { name: 'setup_fee', label: 'One-time setup fee', type: 'number' } : null,
       fin ? { name: 'next_billing_date', label: 'Next billing date', type: 'date' } : null,
@@ -483,7 +508,7 @@ PAGES.websites = async (m) => {
     const list = rows.filter((w) => (!fs || w.status === fs) && (!fc || w.billing_cycle === fc) && (!q || [w.name, w.domain, w.client_name, w.handler_name, w.category].join(' ').toLowerCase().includes(q)));
     $('#tb').innerHTML = list.length ? list.map((w) => `<tr><td><a href="#/website/${w.id}"><b>${h(w.name)}</b></a><div class="muted small">${h(w.domain || '')}</div></td>
       <td>${w.client_id && canSeeClients() ? `<a href="#/client/${w.client_id}">${h(w.client_name)}</a>` : h(w.client_name || '—')}</td><td>${h(w.handler_name || '—')}</td><td>${badge(w.status)}</td>
-      ${fin ? `<td class="nowrap">${w.price ? `${money(w.price)} <span class="muted small">${CYCLE[w.billing_cycle]}</span>` : '—'}</td><td class="right num">${money(w.revenue)}</td>` : ''}
+      ${fin ? `<td class="nowrap">${w.price ? `${money(w.price, w.currency)} <span class="muted small">${CYCLE[w.billing_cycle]}</span>` : '—'}</td><td class="right num">${money(w.revenue)}</td>` : ''}
       <td class="right num">${w.open_tasks}</td><td class="right num">${w.cred_count}</td><td class="nowrap">${fmtDate(w.onboard_date)}</td></tr>`).join('')
       : `<tr><td colspan="9" class="empty">${rows.length ? 'No websites match.' : 'No websites yet. Add your first one.'}</td></tr>`;
   };
@@ -495,7 +520,7 @@ PAGES.website = async (m, [id, tab = 'overview']) => {
   const d = await api('GET', `/websites/${id}`);
   const w = d.website;
   const P = S.me.perms;
-  const tabs = [['overview', 'Overview'], d.credentials && ['vault', `Passwords (${d.credentials.length})`], ['tasks', `Tasks (${d.tasks.filter((t) => t.status !== 'done').length})`], ['timeline', 'Timeline & comments'], d.invoices && ['billing', 'Billing'], d.onboarding && ['onboarding', 'Onboarding']].filter(Boolean);
+  const tabs = [['overview', 'Overview'], d.credentials && ['vault', `Passwords (${d.credentials.length})`], (P.websites_edit || P.finance_view) && ['services', 'Domains & services'], ['tasks', `Tasks (${d.tasks.filter((t) => t.status !== 'done').length})`], ['timeline', 'Timeline & comments'], d.invoices && ['billing', 'Billing'], d.onboarding && ['onboarding', 'Onboarding']].filter(Boolean);
   const actions = [
     P.websites_edit && `<button data-act="siteMembers" data-id="${w.id}">Team access</button>`,
     P.finance_edit && w.price > 0 && `<button data-act="planInvoice" data-id="${w.id}">Generate invoice</button>`,
@@ -516,11 +541,13 @@ PAGES.website = async (m, [id, tab = 'overview']) => {
         <dt>Services / work</dt><dd class="pre">${h(w.services || '—')}</dd></dl></div>
       <div class="grid">
       ${w.price !== undefined ? `<div class="card"><h2>Pricing & revenue</h2><dl class="kv">
-        <dt>Plan</dt><dd>${money(w.price)} · ${CYCLE[w.billing_cycle]}</dd>
-        <dt>Monthly value</dt><dd>${money(w.mrr)}</dd>
-        <dt>Setup fee</dt><dd>${money(w.setup_fee)}</dd>
+        <dt>Plan</dt><dd>${money(w.price, w.currency)} · ${CYCLE[w.billing_cycle]}</dd>
+        <dt>Monthly value</dt><dd>${moneyDual(w.mrr, w.currency, w.mrr_base)}</dd>
+        <dt>Setup fee</dt><dd>${money(w.setup_fee, w.currency)}</dd>
         <dt>Next billing</dt><dd>${w.billing_cycle === 'one_time' ? '—' : dueBadge(w.next_billing_date)}</dd>
-        <dt>Total revenue</dt><dd><b>${money(w.revenue)}</b></dd></dl></div>` : ''}
+        <dt>Total revenue</dt><dd><b>${money(w.revenue)}</b></dd>
+        <dt>Total costs</dt><dd>${money(w.expenses)}</dd>
+        <dt>Profit</dt><dd><b class="${w.revenue - w.expenses < 0 ? 'down' : ''}">${money(w.revenue - w.expenses)}</b></dd></dl></div>` : ''}
       <div class="card"><h2>Special comments</h2><div class="pre">${h(w.special_comments || '') || '<span class="muted">None</span>'}</div></div>
       <div class="card"><h2>Social links</h2>${social.length ? `<dl class="kv">${social.map(([k, v]) => `<dt>${h(SOCIAL[k] || k)}</dt><dd>${extLink(v)}</dd>`).join('')}</dl>` : '<span class="muted">No social links added.</span>'}</div>
       </div></div>`;
@@ -542,9 +569,11 @@ PAGES.website = async (m, [id, tab = 'overview']) => {
       <div class="card"><h2>Timeline</h2>${d.notes.length ? `<ul class="list tl">${d.notes.map((n) => `<li><div class="grow">${badge(n.type, NOTE[n.type])} <b>${h(n.title || '')}</b>${n.amount ? ` <span class="badge b-good">${money(n.amount)}</span>` : ''}
         <div class="pre">${h(n.body || '')}</div><div class="muted small">${h(n.author_name || 'Client')} · ${fmtDateTime(n.created_at)}</div></div>
         ${n.author_id === S.me.id || P.websites_edit ? `<button class="sm danger" data-act="noteDelete" data-id="${n.id}">Delete</button>` : ''}</li>`).join('')}</ul>` : '<div class="empty">Nothing yet.</div>'}</div>`;
+  } else if (tab === 'services') {
+    body = await siteServicesTab(w);
   } else if (tab === 'billing') {
-    const paid = d.payments.filter((p) => p.type === 'income').reduce((s, p) => s + p.amount, 0);
-    const spent = d.payments.filter((p) => p.type === 'expense').reduce((s, p) => s + p.amount, 0);
+    const paid = d.payments.filter((p) => p.type === 'income').reduce((s, p) => s + p.amount_base, 0);
+    const spent = d.payments.filter((p) => p.type === 'expense').reduce((s, p) => s + p.amount_base, 0);
     body = `<div class="kpis"><div class="kpi"><div class="label">Revenue received</div><div class="value">${money(paid)}</div></div><div class="kpi"><div class="label">Expenses</div><div class="value">${money(spent)}</div></div><div class="kpi"><div class="label">Profit</div><div class="value">${money(paid - spent)}</div></div></div>
       <div class="toolbar"><span style="margin-left:auto"></span>${P.finance_edit ? `<button data-act="payNew" data-site="${w.id}">Record payment / expense</button><button class="primary" data-act="invNew" data-site="${w.id}" data-client="${w.client_id || ''}">+ New invoice</button>` : ''}</div>
       <div class="grid g2"><div class="card"><h2>Invoices</h2>${invoiceTable(d.invoices, true)}</div><div class="card"><h2>Payments & expenses</h2>${paymentTable(d.payments, true)}</div></div>`;
@@ -687,7 +716,7 @@ PAGES.tasks = async (m) => {
 ACT.noteDelete = async (ds) => { if (await confirmBox('Delete entry?', 'Remove this timeline entry?')) { await api('DELETE', `/notes/${ds.id}`); refresh(); } };
 
 // ---------- clients ----------
-const clientFields = [
+const clientFields = () => [
   { name: 'name', label: 'Contact name', required: true },
   { name: 'company', label: 'Company' },
   { name: 'email', label: 'Email', type: 'email' },
@@ -697,14 +726,15 @@ const clientFields = [
   { name: 'address', label: 'Address', type: 'textarea', full: true },
   { type: 'html', full: true, html: '<h3 style="margin-top:6px">Billing</h3>' },
   { name: 'billing_email', label: 'Billing email', type: 'email' },
+  currencyField('currency', 'Billing currency', '— Company base currency —'),
   { name: 'tax_id', label: 'GST / Tax ID' },
   { name: 'billing_address', label: 'Billing address', type: 'textarea', full: true },
   { name: 'notes', label: 'Notes', type: 'textarea', full: true },
 ];
-ACT.clientNew = () => openModal({ title: 'Add client', wide: true, body: formHTML(clientFields, { status: 'active' }), onSubmit: async (d) => { const r = await api('POST', '/clients', d); location.hash = `#/client/${r.id}`; } });
+ACT.clientNew = () => openModal({ title: 'Add client', wide: true, body: formHTML(clientFields(), { status: 'active' }), onSubmit: async (d) => { const r = await api('POST', '/clients', d); location.hash = `#/client/${r.id}`; } });
 ACT.clientEdit = async (ds) => {
   const { client } = await api('GET', `/clients/${ds.id}`);
-  openModal({ title: 'Edit client', wide: true, body: formHTML(clientFields, client), onSubmit: async (d) => { await api('PUT', `/clients/${ds.id}`, d); toast('Saved'); refresh(); } });
+  openModal({ title: 'Edit client', wide: true, body: formHTML(clientFields(), client), onSubmit: async (d) => { await api('PUT', `/clients/${ds.id}`, d); toast('Saved'); refresh(); } });
 };
 ACT.clientDelete = async (ds) => {
   if (!(await confirmBox('Delete client?', 'Websites stay but are unlinked from this client. Follow-ups and onboarding requests for this client are deleted.'))) return;
@@ -737,7 +767,7 @@ PAGES.client = async (m, [id]) => {
   ].filter(Boolean).join(''), `${h(c.company || '')} · <a href="#/clients">All clients</a>`)
     + `<div class="grid g2"><div class="card"><h2>Contact & billing</h2><dl class="kv">
       <dt>Email</dt><dd>${c.email ? `<a href="mailto:${h(c.email)}">${h(c.email)}</a>` : '—'}</dd><dt>Phone</dt><dd>${h(c.phone || '—')}</dd>
-      <dt>Address</dt><dd class="pre">${h(c.address || '—')}</dd><dt>Billing email</dt><dd>${h(c.billing_email || '—')}</dd><dt>GST / Tax ID</dt><dd>${h(c.tax_id || '—')}</dd>
+      <dt>Address</dt><dd class="pre">${h(c.address || '—')}</dd><dt>Billing email</dt><dd>${h(c.billing_email || '—')}</dd><dt>Billing currency</dt><dd>${h(c.currency || S.cur.base)}</dd><dt>GST / Tax ID</dt><dd>${h(c.tax_id || '—')}</dd>
       <dt>Billing address</dt><dd class="pre">${h(c.billing_address || '—')}</dd><dt>Source</dt><dd>${h(c.source || '—')}</dd><dt>Client since</dt><dd>${fmtDate(c.created_at)}</dd>
       <dt>Notes</dt><dd class="pre">${h(c.notes || '—')}</dd></dl></div>
       <div class="card"><h2>Websites</h2>${d.websites.length ? `<ul class="list">${d.websites.map((w) => `<li><div class="grow"><a href="#/website/${w.id}"><b>${h(w.name)}</b></a><div class="muted small">${h(w.domain || '')} · ${h(w.handler_name || 'Unassigned')}</div></div>${badge(w.status)}</li>`).join('')}</ul>` : '<div class="empty">No websites linked.</div>'}</div>
@@ -752,12 +782,12 @@ function invoiceTable(rows, compactView) {
   if (!rows || !rows.length) return '<div class="empty">No invoices.</div>';
   return `<div class="table-wrap"><table><thead><tr><th>Invoice</th>${compactView ? '' : '<th>Client</th><th>Website</th>'}<th>Issued</th><th>Due</th><th class="right">Total</th><th>Status</th></tr></thead><tbody>
     ${rows.map((i) => `<tr><td><a href="#/invoice/${i.id}"><b>${h(i.number)}</b></a></td>${compactView ? '' : `<td>${h(i.client_name || '—')}</td><td>${h(i.website_name || '—')}</td>`}
-      <td class="nowrap">${fmtDate(i.issue_date)}</td><td class="nowrap">${fmtDate(i.due_date)}</td><td class="right num">${money(i.total)}</td><td>${badge(i.status)}</td></tr>`).join('')}</tbody></table></div>`;
+      <td class="nowrap">${fmtDate(i.issue_date)}</td><td class="nowrap">${fmtDate(i.due_date)}</td><td class="right num">${money(i.total, i.currency)}</td><td>${badge(i.status)}</td></tr>`).join('')}</tbody></table></div>`;
 }
 function paymentTable(rows, compactView) {
   if (!rows || !rows.length) return '<div class="empty">No payments recorded.</div>';
   return `<div class="table-wrap"><table><thead><tr><th>Date</th><th>Type</th><th class="right">Amount</th>${compactView ? '' : '<th>Client / website</th>'}<th>Details</th>${can('finance_edit') ? '<th></th>' : ''}</tr></thead><tbody>
-    ${rows.map((p) => `<tr><td class="nowrap">${fmtDate(p.date)}</td><td>${badge(p.type)}</td><td class="right num">${money(p.amount)}</td>
+    ${rows.map((p) => `<tr><td class="nowrap">${fmtDate(p.date)}</td><td>${badge(p.type)}</td><td class="right num">${moneyDual(p.amount, p.currency, p.amount_base)}</td>
       ${compactView ? '' : `<td class="small">${h(p.client_name || '')}${p.website_name ? `<br><a href="#/website/${p.website_id}/billing">${h(p.website_name)}</a>` : ''}</td>`}
       <td class="small">${h([p.category, p.method, p.note].filter(Boolean).join(' · '))}</td>${can('finance_edit') ? `<td class="right"><button class="sm danger" data-act="payDelete" data-id="${p.id}">Delete</button></td>` : ''}</tr>`).join('')}</tbody></table></div>`;
 }
@@ -768,20 +798,22 @@ ACT.payNew = async (ds) => {
     body: formHTML([
       { name: 'type', label: 'Type', type: 'select', options: [['income', 'Income (payment received)'], ['expense', 'Expense (money spent)']] },
       { name: 'amount', label: 'Amount', type: 'number', required: true },
+      currencyField(),
       { name: 'date', label: 'Date', type: 'date' },
       { name: 'method', label: 'Method', placeholder: 'UPI, bank transfer, card, cash…' },
       { name: 'website_id', label: 'Website', type: 'select', options: opts(sites, '— None —') },
       { name: 'client_id', label: 'Client', type: 'select', options: opts(clients, '— From website / none —') },
       { name: 'category', label: 'Category', placeholder: 'Retainer, ads spend, domain renewal, freelancer…' },
       { name: 'note', label: 'Note', type: 'textarea', full: true },
-    ], { type: 'income', date: todayStr(), website_id: ds.site || '' }),
+    ], { type: 'income', date: todayStr(), website_id: ds.site || '', currency: S.cur.base }),
     onSubmit: async (d) => { await api('POST', '/payments', d); toast('Recorded'); refresh(); },
   });
 };
 ACT.payDelete = async (ds) => { if (await confirmBox('Delete payment?', 'If it came from an invoice, that invoice goes back to unpaid.')) { await api('DELETE', `/payments/${ds.id}`); refresh(); } };
 
 async function invoiceEditor(inv) {
-  const [sites, clients] = await Promise.all([api('GET', '/websites'), clientOptions()]);
+  const [sites, clients, catalog] = await Promise.all([api('GET', '/websites'), clientOptions(), api('GET', '/catalog')]);
+  S.catalog = catalog.filter((c) => c.active);
   const items = inv.items && inv.items.length ? inv.items : [{ description: '', qty: 1, rate: 0 }];
   const fields = [
     { name: 'client_id', label: 'Client', type: 'select', options: opts(clients, '— Select client —') },
@@ -789,13 +821,14 @@ async function invoiceEditor(inv) {
     { name: 'issue_date', label: 'Issue date', type: 'date' },
     { name: 'due_date', label: 'Due date', type: 'date' },
     inv.id ? { name: 'status', label: 'Status', type: 'select', options: [['draft', 'Draft'], ['sent', 'Sent'], ['paid', 'Paid'], ['cancelled', 'Cancelled']] } : null,
+    currencyField('currency', 'Currency', '— Client / website default —'),
     { name: 'tax_rate', label: 'Tax rate %', type: 'number' },
     { name: 'discount', label: 'Discount (amount)', type: 'number' },
   ];
   const row = (it) => `<tr class="item"><td><input data-k="description" value="${h(it.description)}" placeholder="Description"></td><td style="width:80px"><input data-k="qty" type="number" step="any" value="${h(it.qty)}"></td><td style="width:120px"><input data-k="rate" type="number" step="any" value="${h(it.rate)}"></td><td class="right num amt" style="width:110px"></td><td style="width:40px"><button type="button" class="sm" data-rm>✕</button></td></tr>`;
   const body = formHTML(fields, { tax_rate: S.settings.tax_rate, discount: 0, ...inv })
     + `<h3 style="margin-top:16px">Items</h3><div class="table-wrap"><table><thead><tr><th>Description</th><th>Qty</th><th>Rate</th><th class="right">Amount</th><th></th></tr></thead><tbody id="items">${items.map(row).join('')}</tbody></table></div>
-      <p><button type="button" class="sm" id="addItem">+ Add line</button></p><div class="right" id="invTotals"></div>`
+      <p class="toolbar"><button type="button" class="sm" id="addItem">+ Add line</button>${S.catalog.length ? `<select id="addCat" style="max-width:320px"><option value="">+ Add from services catalog…</option>${S.catalog.map((c) => `<option value="${c.id}">${h(c.name)} — ${h(money(c.price, c.currency))}</option>`).join('')}</select>` : ''}</p><div class="right" id="invTotals"></div>`
     + formHTML([{ name: 'notes', label: 'Notes / terms (shown on invoice)', type: 'textarea', full: true }], { notes: inv.id ? inv.notes : S.settings.invoice_terms || '', ...(inv.id ? {} : {}) });
   return { body, row };
 }
@@ -805,12 +838,18 @@ function wireInvoiceEditor(form, row) {
     let sub = 0;
     $$('#items tr.item', form).forEach((tr) => {
       const q = +$('[data-k=qty]', tr).value || 0, r = +$('[data-k=rate]', tr).value || 0;
-      $('.amt', tr).textContent = money(q * r); sub += q * r;
+      $('.amt', tr).textContent = money(q * r, $('[name=currency]', form).value || undefined); sub += q * r;
     });
     const disc = +$('[name=discount]', form).value || 0, tax = ((sub - disc) * (+$('[name=tax_rate]', form).value || 0)) / 100;
-    $('#invTotals', form).innerHTML = `Subtotal ${money(sub)} · Discount ${money(disc)} · Tax ${money(tax)} · <b>Total ${money(sub - disc + tax)}</b>`;
+    const cur = $('[name=currency]', form).value || undefined;
+    $('#invTotals', form).innerHTML = `Subtotal ${money(sub, cur)} · Discount ${money(disc, cur)} · Tax ${money(tax, cur)} · <b>Total ${money(sub - disc + tax, cur)}</b>`;
   };
   form.addEventListener('input', recalc);
+  $('#addCat', form)?.addEventListener('change', (e) => {
+    const c = S.catalog.find((x) => x.id === +e.target.value);
+    if (c) { $('#items', form).insertAdjacentHTML('beforeend', row({ description: c.name + (c.description ? ' — ' + c.description : ''), qty: 1, rate: c.price })); recalc(); }
+    e.target.value = '';
+  });
   form.addEventListener('click', (e) => {
     if (e.target.matches('[data-rm]')) { e.target.closest('tr').remove(); recalc(); }
     if (e.target.id === 'addItem') { $('#items', form).insertAdjacentHTML('beforeend', row({ description: '', qty: 1, rate: 0 })); recalc(); }
@@ -841,17 +880,18 @@ ACT.invDelete = async (ds) => { if (await confirmBox('Delete invoice?', 'This ca
 ACT.print = () => window.print();
 
 PAGES.finance = async (m, [tab = 'invoices']) => {
-  const tabs = `<div class="tabs"><button data-act="nav" data-href="#/finance/invoices" class="${tab === 'invoices' ? 'active' : ''}">Invoices</button><button data-act="nav" data-href="#/finance/payments" class="${tab === 'payments' ? 'active' : ''}">Payments & expenses</button></div>`;
+  const tabs = `<div class="tabs"><button data-act="nav" data-href="#/finance/invoices" class="${tab === 'invoices' ? 'active' : ''}">Invoices</button><button data-act="nav" data-href="#/finance/payments" class="${tab === 'payments' ? 'active' : ''}">Payments & expenses</button><button data-act="nav" data-href="#/finance/catalog" class="${tab === 'catalog' ? 'active' : ''}">Services catalog</button></div>`;
+  if (tab === 'catalog') return catalogPage(m, tabs);
   const FE = can('finance_edit');
   if (tab === 'payments') {
     const rows = await api('GET', '/payments');
-    m.innerHTML = pageHead('Finance', FE ? '<button class="primary" data-act="payNew">+ Record payment / expense</button>' : '') + tabs
+    m.innerHTML = pageHead('Finance', '<a class="btn" href="/api/export/payments.csv">Export CSV</a>' + (FE ? '<button class="primary" data-act="payNew">+ Record payment / expense</button>' : '')) + tabs
       + `<div class="card"><div class="toolbar"><label class="check">From <input type="date" id="pf"></label><label class="check">To <input type="date" id="pt"></label><select id="ptype"><option value="">Income & expenses</option><option value="income">Income</option><option value="expense">Expenses</option></select></div>
       <div class="kpis" id="psum"></div><div id="plist"></div></div>`;
     const draw = () => {
       const f = $('#pf').value, t = $('#pt').value, ty = $('#ptype').value;
       const list = rows.filter((p) => (!f || p.date >= f) && (!t || p.date <= t) && (!ty || p.type === ty));
-      const inc = list.filter((p) => p.type === 'income').reduce((s, p) => s + p.amount, 0), exp = list.filter((p) => p.type === 'expense').reduce((s, p) => s + p.amount, 0);
+      const inc = list.filter((p) => p.type === 'income').reduce((s, p) => s + p.amount_base, 0), exp = list.filter((p) => p.type === 'expense').reduce((s, p) => s + p.amount_base, 0);
       $('#psum').innerHTML = `<div class="kpi"><div class="label">Income</div><div class="value">${money(inc)}</div></div><div class="kpi"><div class="label">Expenses</div><div class="value">${money(exp)}</div></div><div class="kpi"><div class="label">Net profit</div><div class="value ${inc - exp >= 0 ? '' : 'down'}">${money(inc - exp)}</div></div>`;
       $('#plist').innerHTML = paymentTable(list, false);
     };
@@ -860,7 +900,7 @@ PAGES.finance = async (m, [tab = 'invoices']) => {
     return;
   }
   const rows = await api('GET', '/invoices');
-  m.innerHTML = pageHead('Finance', FE ? '<button class="primary" data-act="invNew">+ New invoice</button>' : '') + tabs
+  m.innerHTML = pageHead('Finance', '<a class="btn" href="/api/export/invoices.csv">Export CSV</a>' + (FE ? '<button class="primary" data-act="invNew">+ New invoice</button>' : '')) + tabs
     + `<div class="card"><div class="toolbar"><select id="is"><option value="">All invoices</option><option value="draft">Draft</option><option value="sent">Sent (unpaid)</option><option value="overdue">Overdue</option><option value="paid">Paid</option><option value="cancelled">Cancelled</option></select><input type="search" id="iq" placeholder="Search number, client, website…"></div><div id="ilist"></div></div>`;
   const draw = () => {
     const s = $('#is').value, q = $('#iq').value.toLowerCase();
@@ -872,6 +912,7 @@ PAGES.finance = async (m, [tab = 'invoices']) => {
 
 PAGES.invoice = async (m, [id]) => {
   const { invoice: i, client: c, website: w, settings: s } = await api('GET', `/invoices/${id}`);
+  const cur = i.currency || s.currency;
   const FE = can('finance_edit');
   m.innerHTML = pageHead(`Invoice ${h(i.number)} ${badge(i.status)}`, [
     '<button data-act="print">Print / Save PDF</button>',
@@ -886,9 +927,9 @@ PAGES.invoice = async (m, [id]) => {
       <div style="margin:28px 0 18px"><div class="muted small">BILL TO</div><b>${h(c?.company || c?.name || '—')}</b>
         <div class="pre small">${h([c?.company ? c.name : '', c?.billing_address || c?.address, c?.billing_email || c?.email, c?.tax_id && 'GST/Tax: ' + c.tax_id].filter(Boolean).join('\n'))}</div>${w ? `<div class="small muted">Project: ${h(w.name)}${w.domain ? ' (' + h(w.domain) + ')' : ''}</div>` : ''}</div>
       <table><thead><tr><th>Description</th><th class="right">Qty</th><th class="right">Rate</th><th class="right">Amount</th></tr></thead><tbody>
-        ${i.items.map((it) => `<tr><td>${h(it.description)}</td><td class="right num">${h(it.qty)}</td><td class="right num">${money(it.rate)}</td><td class="right num">${money(it.qty * it.rate)}</td></tr>`).join('')}</tbody></table>
-      <div class="totals"><div><span>Subtotal</span><span class="num">${money(i.subtotal)}</span></div>${i.discount ? `<div><span>Discount</span><span class="num">−${money(i.discount)}</span></div>` : ''}
-        <div><span>Tax (${h(i.tax_rate)}%)</span><span class="num">${money(i.tax)}</span></div><div class="grand"><span>Total</span><span class="num">${money(i.total)}</span></div></div>
+        ${i.items.map((it) => `<tr><td>${h(it.description)}</td><td class="right num">${h(it.qty)}</td><td class="right num">${money(it.rate, cur)}</td><td class="right num">${money(it.qty * it.rate, cur)}</td></tr>`).join('')}</tbody></table>
+      <div class="totals"><div><span>Subtotal</span><span class="num">${money(i.subtotal, cur)}</span></div>${i.discount ? `<div><span>Discount</span><span class="num">−${money(i.discount, cur)}</span></div>` : ''}
+        <div><span>Tax (${h(i.tax_rate)}%)</span><span class="num">${money(i.tax, cur)}</span></div><div class="grand"><span>Total (${h(cur)})</span><span class="num">${money(i.total, cur)}</span></div></div>
       ${s.payment_details ? `<div style="margin-top:24px"><div class="muted small">PAYMENT DETAILS</div><div class="pre small">${h(s.payment_details)}</div></div>` : ''}
       ${i.notes ? `<div style="margin-top:18px"><div class="muted small">NOTES</div><div class="pre small">${h(i.notes)}</div></div>` : ''}</div>`
     + (FE ? `<p class="no-print" style="margin-top:20px"><button class="danger sm" data-act="invDelete" data-id="${i.id}">Delete invoice</button></p>` : '');
@@ -1071,19 +1112,26 @@ PAGES.settings = async (m) => {
     { name: 'company_phone', label: 'Phone' },
     { name: 'company_tax_id', label: 'GST / Tax ID' },
     { name: 'company_address', label: 'Address', type: 'textarea', full: true },
-    { name: 'currency', label: 'Currency code', help: 'e.g. INR, USD, EUR, GBP, AED' },
+    { name: 'currency', label: 'Base currency', help: 'All reports are converted to this currency. Set it once before adding data (e.g. INR, USD).' },
     { name: 'tax_rate', label: 'Default tax rate %', type: 'number' },
     { name: 'invoice_prefix', label: 'Invoice prefix' },
     { name: 'invoice_next', label: 'Next invoice number', type: 'number' },
     { name: 'payment_details', label: 'Payment details (shown on invoices)', type: 'textarea', full: true, placeholder: 'Bank name, account no., IFSC, UPI ID…' },
     { name: 'invoice_terms', label: 'Default invoice terms', type: 'textarea', full: true },
-  ], s)}<div class="err hidden"></div><p><button class="primary" type="submit">Save settings</button></p></form></div>`;
+  ], s)}<div class="err hidden"></div><p><button class="primary" type="submit">Save settings</button></p></form></div>
+    <div class="card" style="margin-top:16px"><h2>Currencies & exchange rates</h2>
+      <p class="muted small">Bill clients and pay staff in any currency. Set how many ${h(S.cur.base)} one unit of each currency is worth; payments are converted at the rate in effect when they're recorded.</p>
+      <div class="table-wrap"><table><thead><tr><th>Currency</th><th>1 unit = (${h(S.cur.base)})</th><th>Updated</th><th></th></tr></thead><tbody>
+      <tr><td><b>${h(S.cur.base)}</b> <span class="badge b-accent">base</span></td><td class="num">1</td><td></td><td></td></tr>
+      ${S.cur.rates.map((r) => `<tr><td><b>${h(r.code)}</b></td><td class="num">${h(r.rate)}</td><td class="small muted">${fmtDate(r.updated_at)}</td><td class="right nowrap"><button class="sm" data-act="curEdit" data-code="${h(r.code)}" data-rate="${h(r.rate)}">Update rate</button> <button class="sm danger" data-act="curDelete" data-code="${h(r.code)}">✕</button></td></tr>`).join('')}
+      </tbody></table></div><p><button data-act="curEdit">+ Add currency</button></p></div>`;
   $('#sf').addEventListener('submit', async (e) => {
     e.preventDefault();
     try {
       const d = readForm(e.target);
       await api('PUT', '/settings', d);
       Object.assign(S.settings, { company_name: d.company_name, currency: d.currency, tax_rate: d.tax_rate, invoice_terms: d.invoice_terms });
+      S.cur = await api('GET', '/currencies');
       toast('Settings saved'); refresh();
     } catch (ex) { const er = $('.err', e.target); er.textContent = ex.message; er.classList.remove('hidden'); }
   });
@@ -1134,4 +1182,4 @@ PAGES.account = async (m) => {
   bind('delForm', async (d) => { await api('DELETE', '/account', d); S.me = null; location.hash = '#/'; route(); });
 };
 
-route();
+window.addEventListener('DOMContentLoaded', route);

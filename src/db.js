@@ -213,6 +213,147 @@ CREATE INDEX IF NOT EXISTS idx_pay_date ON payments(date);
 CREATE INDEX IF NOT EXISTS idx_notes_site ON notes(website_id);
 `);
 
+// ---- v2: HR & payroll, freelance work, procurement, service catalog, multi-currency ----
+db.exec(`
+CREATE TABLE IF NOT EXISTS currencies (
+  code TEXT PRIMARY KEY,
+  rate REAL NOT NULL,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS employees (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  employee_code TEXT,
+  official_name TEXT NOT NULL,
+  display_name TEXT,
+  designation TEXT,
+  department TEXT,
+  employment_type TEXT NOT NULL DEFAULT 'full_time',
+  email TEXT,
+  phone TEXT,
+  join_date TEXT,
+  exit_date TEXT,
+  status TEXT NOT NULL DEFAULT 'active',
+  currency TEXT,
+  salary_structure TEXT NOT NULL DEFAULT '{"earnings":[],"deductions":[]}',
+  bank_enc TEXT,
+  id_docs_enc TEXT,
+  address TEXT,
+  emergency_contact TEXT,
+  notes TEXT,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS employee_benefits (
+  id INTEGER PRIMARY KEY,
+  employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+  type TEXT NOT NULL DEFAULT 'other',
+  title TEXT NOT NULL,
+  amount REAL,
+  currency TEXT,
+  frequency TEXT,
+  provider TEXT,
+  start_date TEXT,
+  end_date TEXT,
+  notes TEXT,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS payslips (
+  id INTEGER PRIMARY KEY,
+  employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+  month TEXT NOT NULL,
+  working_days REAL,
+  paid_days REAL,
+  earnings TEXT NOT NULL DEFAULT '[]',
+  deductions TEXT NOT NULL DEFAULT '[]',
+  gross REAL NOT NULL DEFAULT 0,
+  total_deductions REAL NOT NULL DEFAULT 0,
+  net REAL NOT NULL DEFAULT 0,
+  currency TEXT,
+  status TEXT NOT NULL DEFAULT 'draft',
+  paid_date TEXT,
+  method TEXT,
+  notes TEXT,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (employee_id, month)
+);
+
+CREATE TABLE IF NOT EXISTS freelance_jobs (
+  id INTEGER PRIMARY KEY,
+  employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+  freelancer_name TEXT,
+  website_id INTEGER REFERENCES websites(id) ON DELETE SET NULL,
+  title TEXT NOT NULL,
+  description TEXT,
+  status TEXT NOT NULL DEFAULT 'assigned',
+  assigned_date TEXT,
+  due_date TEXT,
+  amount REAL NOT NULL DEFAULT 0,
+  currency TEXT,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS procurements (
+  id INTEGER PRIMARY KEY,
+  website_id INTEGER REFERENCES websites(id) ON DELETE CASCADE,
+  client_id INTEGER REFERENCES clients(id) ON DELETE SET NULL,
+  type TEXT NOT NULL DEFAULT 'other',
+  item TEXT NOT NULL,
+  vendor TEXT,
+  vendor_account TEXT,
+  purchase_date TEXT,
+  expiry_date TEXT,
+  billing_cycle TEXT NOT NULL DEFAULT 'yearly',
+  cost REAL NOT NULL DEFAULT 0,
+  cost_currency TEXT,
+  price REAL NOT NULL DEFAULT 0,
+  price_currency TEXT,
+  auto_renew INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'active',
+  notes TEXT,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS service_catalog (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  category TEXT NOT NULL DEFAULT 'other',
+  description TEXT,
+  price REAL NOT NULL DEFAULT 0,
+  cost REAL NOT NULL DEFAULT 0,
+  currency TEXT,
+  billing_cycle TEXT NOT NULL DEFAULT 'one_time',
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_proc_site ON procurements(website_id);
+CREATE INDEX IF NOT EXISTS idx_proc_expiry ON procurements(expiry_date);
+CREATE INDEX IF NOT EXISTS idx_slip_month ON payslips(month);
+`);
+
+function addColumn(table, col, def) {
+  if (!db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
+}
+addColumn('clients', 'currency', 'TEXT');
+addColumn('websites', 'currency', 'TEXT');
+addColumn('invoices', 'currency', 'TEXT');
+addColumn('invoices', 'exchange_rate', 'REAL NOT NULL DEFAULT 1');
+addColumn('payments', 'currency', 'TEXT');
+addColumn('payments', 'exchange_rate', 'REAL NOT NULL DEFAULT 1');
+addColumn('payments', 'amount_base', 'REAL');
+addColumn('payments', 'source', 'TEXT');
+addColumn('payments', 'source_id', 'INTEGER');
+db.exec('UPDATE payments SET amount_base = amount * exchange_rate WHERE amount_base IS NULL');
+db.exec('CREATE INDEX IF NOT EXISTS idx_pay_source ON payments(source, source_id)');
+
 const DEFAULT_SETTINGS = {
   company_name: 'My Agency',
   company_email: '',

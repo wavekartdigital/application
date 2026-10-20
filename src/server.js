@@ -12,7 +12,7 @@ const SECURE_COOKIE = process.env.COOKIE_SECURE === 'true';
 
 // ---------- constants ----------
 const ROLES = ['owner', 'admin', 'manager', 'member', 'viewer'];
-const PERMS = ['all_websites', 'websites_edit', 'credentials_view', 'credentials_edit', 'finance_view', 'finance_edit', 'clients_manage', 'tasks_manage', 'users_manage'];
+const PERMS = ['all_websites', 'websites_edit', 'credentials_view', 'credentials_edit', 'finance_view', 'finance_edit', 'clients_manage', 'tasks_manage', 'users_manage', 'hr_manage'];
 const ROLE_DEFAULTS = {
   manager: { all_websites: true, websites_edit: true, credentials_view: true, credentials_edit: true, finance_view: true, clients_manage: true, tasks_manage: true },
   member: { credentials_view: true },
@@ -63,6 +63,8 @@ function clean(body, spec) {
       else if (t === 'id') { v = parseInt(v, 10); if (!Number.isInteger(v)) throw bad(`${k} is invalid`); }
       else if (t === 'date') { if (!isDate(v)) throw bad(`${k} must be a date (YYYY-MM-DD)`); }
       else if (Array.isArray(t)) { if (!t.includes(v)) throw bad(`Invalid value for ${k}`); }
+      else if (t === 'cur') { v = String(v).trim().toUpperCase(); if (!/^[A-Z]{3}$/.test(v)) throw bad(`${k} must be a 3-letter currency code`); }
+      else if (t === 'bool') v = v === true || v === 'true' || v === 1 || v === '1' ? 1 : 0;
       else v = String(v).slice(0, t === 'text' ? 20000 : 500).trim();
     }
     out[k] = v;
@@ -81,6 +83,26 @@ function checkEmail(e) {
   return e.trim().toLowerCase();
 }
 const tempPassword = () => crypto.randomBytes(9).toString('base64url');
+
+// ---------- currency ----------
+// Every amount is stored in its own currency; payments also store amount_base (converted to the company
+// base currency at the rate in effect when recorded) so reports can add them up.
+const baseCurrency = () => getSettings().currency || 'INR';
+function rateOf(code, strict = true) {
+  if (!code || code === baseCurrency()) return 1;
+  const r = db.prepare('SELECT rate FROM currencies WHERE code = ?').get(code);
+  if (!r) {
+    if (strict) throw bad(`No exchange rate set for ${code}. Add it under Company settings → Currencies.`);
+    return 1;
+  }
+  return r.rate;
+}
+const toBase = (amount, code) => round2((amount || 0) * rateOf(code, false));
+function recordPayment(d) {
+  const currency = d.currency || baseCurrency();
+  const rate = rateOf(currency);
+  return insert('payments', { ...d, currency, exchange_rate: rate, amount_base: round2(d.amount * rate) });
+}
 
 // ---------- middleware ----------
 app.disable('x-powered-by');
@@ -176,6 +198,7 @@ function startSession(res, userId) {
 
 const api = express.Router();
 app.use('/api', api);
+const dashboardExtensions = []; // feature modules add dashboard sections here
 
 // ---------- setup & auth ----------
 api.get('/setup', (req, res) => {
@@ -372,14 +395,14 @@ api.get('/audit', auth, adminOnly, (req, res) => {
 });
 
 // ---------- clients ----------
-const CLIENT_SPEC = { name: 'str', company: 'str', email: 'str', phone: 'str', address: 'text', tax_id: 'str', billing_email: 'str', billing_address: 'text', status: ['lead', 'onboarding', 'active', 'inactive', 'exited'], source: 'str', notes: 'text' };
+const CLIENT_SPEC = { name: 'str', company: 'str', email: 'str', phone: 'str', address: 'text', tax_id: 'str', billing_email: 'str', billing_address: 'text', status: ['lead', 'onboarding', 'active', 'inactive', 'exited'], source: 'str', notes: 'text', currency: 'cur' };
 const canSeeClients = perm('clients_manage', 'finance_view');
 
 api.get('/clients', auth, canSeeClients, (req, res) => {
   res.json(db.prepare(`SELECT c.*,
       (SELECT COUNT(*) FROM websites w WHERE w.client_id = c.id AND w.status != 'exited') active_sites,
-      (SELECT COALESCE(SUM(amount),0) FROM payments p WHERE p.client_id = c.id AND p.type = 'income') revenue,
-      (SELECT COALESCE(SUM(total),0) FROM invoices i WHERE i.client_id = c.id AND i.status = 'sent') outstanding
+      (SELECT COALESCE(SUM(amount_base),0) FROM payments p WHERE p.client_id = c.id AND p.type = 'income') revenue,
+      (SELECT COALESCE(SUM(total * exchange_rate),0) FROM invoices i WHERE i.client_id = c.id AND i.status = 'sent') outstanding
     FROM clients c ORDER BY c.name COLLATE NOCASE`).all());
 });
 api.get('/clients/:id', auth, canSeeClients, (req, res) => {
@@ -417,13 +440,13 @@ api.delete('/clients/:id', auth, perm('clients_manage'), adminOnly, (req, res) =
 // ---------- websites ----------
 const SITE_SPEC = {
   client_id: 'id', name: 'str', domain: 'str', url: 'str', category: 'str', services: 'text', status: SITE_STATUS, handler_id: 'id',
-  onboard_date: 'date', exit_date: 'date', exit_reason: 'text', billing_cycle: CYCLES, price: 'num', setup_fee: 'num', next_billing_date: 'date', special_comments: 'text',
+  onboard_date: 'date', exit_date: 'date', exit_reason: 'text', billing_cycle: CYCLES, price: 'num', setup_fee: 'num', next_billing_date: 'date', special_comments: 'text', currency: 'cur',
 };
-const FINANCE_FIELDS = ['price', 'setup_fee', 'next_billing_date', 'billing_cycle', 'revenue', 'mrr'];
+const FINANCE_FIELDS = ['price', 'setup_fee', 'next_billing_date', 'billing_cycle', 'revenue', 'expenses', 'mrr', 'mrr_base', 'currency'];
 function siteOut(user, w) {
   const o = { ...w, social: safeJson(w.social, {}) };
   if (!user.perms.finance_view) for (const f of FINANCE_FIELDS) delete o[f];
-  else o.mrr = round2(monthlyValue(w.price, w.billing_cycle));
+  else { o.mrr = round2(monthlyValue(w.price, w.billing_cycle)); o.mrr_base = toBase(o.mrr, w.currency); }
   return o;
 }
 function safeJson(s, dflt) { try { return JSON.parse(s) ?? dflt; } catch { return dflt; } }
@@ -447,7 +470,7 @@ api.get('/websites', auth, (req, res) => {
   const rows = db.prepare(`SELECT w.*, c.name client_name, u.name handler_name,
       (SELECT COUNT(*) FROM credentials x WHERE x.website_id = w.id) cred_count,
       (SELECT COUNT(*) FROM tasks t WHERE t.website_id = w.id AND t.status != 'done') open_tasks,
-      (SELECT COALESCE(SUM(amount),0) FROM payments p WHERE p.website_id = w.id AND p.type = 'income') revenue
+      (SELECT COALESCE(SUM(amount_base),0) FROM payments p WHERE p.website_id = w.id AND p.type = 'income') revenue
     FROM websites w LEFT JOIN clients c ON c.id = w.client_id LEFT JOIN users u ON u.id = w.handler_id
     WHERE ${f.sql} ORDER BY w.name COLLATE NOCASE`).all(...f.params);
   res.json(rows.map((w) => siteOut(req.user, w)));
@@ -457,7 +480,8 @@ api.get('/websites/:id', auth, (req, res) => {
   const P = req.user.perms;
   const site = siteOut(req.user, {
     ...w,
-    revenue: db.prepare("SELECT COALESCE(SUM(amount),0) v FROM payments WHERE website_id = ? AND type = 'income'").get(w.id).v,
+    revenue: db.prepare("SELECT COALESCE(SUM(amount_base),0) v FROM payments WHERE website_id = ? AND type = 'income'").get(w.id).v,
+    expenses: db.prepare("SELECT COALESCE(SUM(amount_base),0) v FROM payments WHERE website_id = ? AND type = 'expense'").get(w.id).v,
   });
   res.json({
     website: site,
@@ -479,7 +503,7 @@ api.post('/websites', auth, perm('websites_edit'), (req, res) => {
   const d = siteBody(req.body);
   requireFields(d, ['name']);
   if (!d.onboard_date) d.onboard_date = today();
-  if (!req.user.perms.finance_edit) for (const f of ['price', 'setup_fee', 'next_billing_date', 'billing_cycle']) delete d[f];
+  if (!req.user.perms.finance_edit) for (const f of ['price', 'setup_fee', 'next_billing_date', 'billing_cycle', 'currency']) delete d[f];
   const id = insert('websites', d);
   if (!req.user.perms.all_websites) db.prepare('INSERT OR IGNORE INTO website_members (website_id, user_id) VALUES (?,?)').run(id, req.user.id);
   audit(req, 'website_created', 'website', id, d.name);
@@ -489,7 +513,7 @@ api.put('/websites/:id', auth, perm('websites_edit'), (req, res) => {
   const w = getSite(req.user, req.params.id);
   const d = siteBody(req.body);
   if ('name' in d) requireFields(d, ['name']);
-  if (!req.user.perms.finance_edit) for (const f of ['price', 'setup_fee', 'next_billing_date', 'billing_cycle']) delete d[f];
+  if (!req.user.perms.finance_edit) for (const f of ['price', 'setup_fee', 'next_billing_date', 'billing_cycle', 'currency']) delete d[f];
   if (d.status === 'exited' && !d.exit_date && !w.exit_date) d.exit_date = today();
   update('websites', w.id, { ...d, updated_at: new Date().toISOString() });
   audit(req, 'website_updated', 'website', w.id);
@@ -666,12 +690,19 @@ function nextInvoiceNumber() {
   setSetting('invoice_next', n + 1);
   return s.invoice_prefix + n;
 }
-const INV_SPEC = { client_id: 'id', website_id: 'id', issue_date: 'date', due_date: 'date', status: ['draft', 'sent', 'paid', 'cancelled'], notes: 'text' };
+const INV_SPEC = { client_id: 'id', website_id: 'id', issue_date: 'date', due_date: 'date', status: ['draft', 'sent', 'paid', 'cancelled'], notes: 'text', currency: 'cur' };
 function invoiceOut(i) {
   return { ...i, items: safeJson(i.items, []), status: i.status === 'sent' && i.due_date && i.due_date < today() ? 'overdue' : i.status };
 }
 function linkClientFromSite(d) {
   if (d.website_id && !d.client_id) d.client_id = db.prepare('SELECT client_id FROM websites WHERE id = ?').get(d.website_id)?.client_id ?? null;
+}
+// Billing currency: explicit > website > client > company base.
+function billingCurrency(d) {
+  return d.currency
+    || (d.website_id && db.prepare('SELECT currency FROM websites WHERE id = ?').get(d.website_id)?.currency)
+    || (d.client_id && db.prepare('SELECT currency FROM clients WHERE id = ?').get(d.client_id)?.currency)
+    || baseCurrency();
 }
 const createInvoice = db.transaction((user, d, totals) => {
   const number = nextInvoiceNumber();
@@ -700,6 +731,8 @@ api.post('/invoices', auth, perm('finance_edit'), (req, res) => {
   d.due_date ||= addPeriod(d.issue_date, 'weekly');
   d.status ||= 'draft';
   linkClientFromSite(d);
+  d.currency = billingCurrency(d);
+  d.exchange_rate = rateOf(d.currency);
   const r = createInvoice(req.user, d, computeInvoice(req.body));
   audit(req, 'invoice_created', 'invoice', r.id, r.number);
   res.json(r);
@@ -711,6 +744,7 @@ api.put('/invoices/:id', auth, perm('finance_edit'), (req, res) => {
   linkClientFromSite(d);
   if ('issue_date' in d && !d.issue_date) d.issue_date = i.issue_date;
   if ('status' in d && !d.status) d.status = i.status;
+  if ('currency' in d) { d.currency = d.currency || i.currency || baseCurrency(); d.exchange_rate = rateOf(d.currency); }
   update('invoices', i.id, { ...d, ...('items' in req.body ? computeInvoice(req.body) : {}) });
   audit(req, 'invoice_updated', 'invoice', i.id, i.number);
   res.json({ ok: true });
@@ -732,7 +766,7 @@ api.post('/invoices/:id/pay', auth, perm('finance_edit'), (req, res) => {
   const date = d.date || today();
   db.transaction(() => {
     update('invoices', i.id, { status: 'paid', paid_date: date });
-    insert('payments', { type: 'income', amount: i.total, date, website_id: i.website_id, client_id: i.client_id, invoice_id: i.id, method: d.method, category: 'invoice', note: `Invoice ${i.number}`, created_by: req.user.id });
+    recordPayment({ type: 'income', amount: i.total, currency: i.currency || baseCurrency(), date, website_id: i.website_id, client_id: i.client_id, invoice_id: i.id, method: d.method, category: 'invoice', note: `Invoice ${i.number}`, created_by: req.user.id });
     db.prepare("UPDATE followups SET status = 'done', completed_at = CURRENT_TIMESTAMP WHERE invoice_id = ? AND status = 'pending'").run(i.id);
   })();
   audit(req, 'invoice_paid', 'invoice', i.id, `${i.number} ${i.total}`);
@@ -759,7 +793,8 @@ api.post('/websites/:id/invoice', auth, perm('finance_edit'), (req, res) => {
   if (w.price) items.push({ description: `${w.name}${w.domain ? ` (${w.domain})` : ''} — ${cycleLabel} plan${end ? ` (${start} to ${periodEnd})` : ''}`, qty: 1, rate: w.price });
   const issue = today();
   const r = db.transaction(() => {
-    const out = createInvoice(req.user, { client_id: w.client_id, website_id: w.id, issue_date: issue, due_date: addPeriod(issue, 'weekly'), status: 'draft', notes: s.invoice_terms }, computeInvoice({ items, tax_rate: s.tax_rate }));
+    const currency = billingCurrency({ website_id: w.id, client_id: w.client_id });
+    const out = createInvoice(req.user, { client_id: w.client_id, website_id: w.id, issue_date: issue, due_date: addPeriod(issue, 'weekly'), status: 'draft', notes: s.invoice_terms, currency, exchange_rate: rateOf(currency) }, computeInvoice({ items, tax_rate: s.tax_rate }));
     if (end) update('websites', w.id, { next_billing_date: end });
     return out;
   })();
@@ -778,11 +813,11 @@ api.get('/payments', auth, perm('finance_view'), (req, res) => {
   res.json(db.prepare(sql + ' ORDER BY p.date DESC, p.id DESC LIMIT 2000').all(...params));
 });
 api.post('/payments', auth, perm('finance_edit'), (req, res) => {
-  const d = clean(req.body, { type: ['income', 'expense'], amount: 'num', date: 'date', website_id: 'id', client_id: 'id', method: 'str', category: 'str', note: 'text' });
+  const d = clean(req.body, { type: ['income', 'expense'], amount: 'num', currency: 'cur', date: 'date', website_id: 'id', client_id: 'id', method: 'str', category: 'str', note: 'text' });
   requireFields(d, ['amount']);
   d.type ||= 'income'; d.date ||= today();
   linkClientFromSite(d);
-  const id = insert('payments', { ...d, created_by: req.user.id });
+  const id = recordPayment({ ...d, created_by: req.user.id });
   audit(req, 'payment_recorded', 'payment', id, `${d.type} ${d.amount}`);
   res.json({ id });
 });
@@ -792,6 +827,8 @@ api.delete('/payments/:id', auth, perm('finance_edit'), (req, res) => {
   db.transaction(() => {
     db.prepare('DELETE FROM payments WHERE id = ?').run(p.id);
     if (p.invoice_id) db.prepare("UPDATE invoices SET status = 'sent', paid_date = NULL WHERE id = ? AND status = 'paid'").run(p.invoice_id);
+    if (p.source === 'payslip') db.prepare("UPDATE payslips SET status = 'draft', paid_date = NULL WHERE id = ?").run(p.source_id);
+    if (p.source === 'freelance') db.prepare("UPDATE freelance_jobs SET status = 'approved' WHERE id = ? AND status = 'paid'").run(p.source_id);
   })();
   audit(req, 'payment_deleted', 'payment', p.id, `${p.type} ${p.amount}`);
   res.json({ ok: true });
@@ -938,7 +975,7 @@ api.get('/dashboard', auth, (req, res) => {
     const k = s.handler_name || 'Unassigned';
     byHandler[k] ||= { name: k, sites: 0, mrr: 0 };
     byHandler[k].sites++;
-    byHandler[k].mrr += monthlyValue(s.price, s.billing_cycle);
+    byHandler[k].mrr += toBase(monthlyValue(s.price, s.billing_cycle), s.currency);
   }
   out.handlers = Object.values(byHandler).sort((a, b) => b.sites - a.sites);
 
@@ -948,12 +985,12 @@ api.get('/dashboard', auth, (req, res) => {
   }
   if (P.finance_view) {
     const payFilter = P.all_websites ? { sql: '1=1', params: [] } : { sql: `p.website_id IN (SELECT w.id FROM websites w WHERE ${f.sql})`, params: f.params };
-    const sum = (type, from, to) => db.prepare(`SELECT COALESCE(SUM(amount),0) v FROM payments p WHERE ${payFilter.sql} AND p.type = ? AND p.date >= ? AND p.date < ?`).get(...payFilter.params, type, from, to).v;
+    const sum = (type, from, to) => db.prepare(`SELECT COALESCE(SUM(amount_base),0) v FROM payments p WHERE ${payFilter.sql} AND p.type = ? AND p.date >= ? AND p.date < ?`).get(...payFilter.params, type, from, to).v;
     const ym = t0.slice(0, 7);
     const monthStart = ym + '-01';
     const nextMonth = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1)).toISOString().slice(0, 10);
     const lastMonth = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() - 1, 1)).toISOString().slice(0, 10);
-    const mrr = live.reduce((s, w) => s + monthlyValue(w.price, w.billing_cycle), 0);
+    const mrr = live.reduce((s, w) => s + toBase(monthlyValue(w.price, w.billing_cycle), w.currency), 0);
     out.finance = {
       mrr: round2(mrr),
       arr: round2(mrr * 12),
@@ -962,19 +999,28 @@ api.get('/dashboard', auth, (req, res) => {
       expense_month: sum('expense', monthStart, nextMonth),
       revenue_ytd: sum('income', t0.slice(0, 4) + '-01-01', nextMonth),
       revenue_all: sum('income', '0000-01-01', '9999-12-31'),
-      outstanding: db.prepare("SELECT COALESCE(SUM(total),0) v, COUNT(*) c FROM invoices WHERE status = 'sent'").get(),
-      overdue: db.prepare("SELECT COALESCE(SUM(total),0) v, COUNT(*) c FROM invoices WHERE status = 'sent' AND due_date < ?").get(t0),
+      expense_ytd: sum('expense', t0.slice(0, 4) + '-01-01', nextMonth),
+      outstanding: db.prepare("SELECT COALESCE(SUM(total * exchange_rate),0) v, COUNT(*) c FROM invoices WHERE status = 'sent'").get(),
+      overdue: db.prepare("SELECT COALESCE(SUM(total * exchange_rate),0) v, COUNT(*) c FROM invoices WHERE status = 'sent' AND due_date < ?").get(t0),
     };
     out.monthly = months.map((m) => {
       const from = m + '-01';
       const [y, mo] = m.split('-').map(Number);
       const to = new Date(Date.UTC(y, mo, 1)).toISOString().slice(0, 10);
-      return { month: m, income: sum('income', from, to), expense: sum('expense', from, to) };
+      const income = sum('income', from, to), expense = sum('expense', from, to);
+      return { month: m, income, expense, profit: round2(income - expense) };
     });
-    out.top_sites = db.prepare(`SELECT w.id, w.name, COALESCE(SUM(p.amount),0) revenue FROM websites w JOIN payments p ON p.website_id = w.id AND p.type = 'income' AND p.date >= ?
+    out.finance.profit_month = round2(out.finance.revenue_month - out.finance.expense_month);
+    out.finance.profit_ytd = round2(out.finance.revenue_ytd - out.finance.expense_ytd);
+    out.finance.base_currency = baseCurrency();
+    out.expense_breakdown = db.prepare(`SELECT COALESCE(NULLIF(p.category, ''), p.source, 'Other') label, ROUND(SUM(p.amount_base), 2) v FROM payments p
+      WHERE ${payFilter.sql} AND p.type = 'expense' AND p.date >= ? GROUP BY 1 ORDER BY v DESC LIMIT 8`).all(...payFilter.params, months[0] + '-01');
+    out.revenue_by_currency = db.prepare(`SELECT COALESCE(p.currency, ?) currency, ROUND(SUM(p.amount), 2) amount, ROUND(SUM(p.amount_base), 2) base FROM payments p
+      WHERE ${payFilter.sql} AND p.type = 'income' AND p.date >= ? GROUP BY 1 ORDER BY base DESC`).all(baseCurrency(), ...payFilter.params, months[0] + '-01');
+    out.top_sites = db.prepare(`SELECT w.id, w.name, COALESCE(SUM(p.amount_base),0) revenue FROM websites w JOIN payments p ON p.website_id = w.id AND p.type = 'income' AND p.date >= ?
       WHERE ${f.sql} GROUP BY w.id ORDER BY revenue DESC LIMIT 8`).all(months[0] + '-01', ...f.params);
     out.billing_due = live.filter((w) => w.billing_cycle !== 'one_time' && w.price > 0 && w.next_billing_date && w.next_billing_date <= in7)
-      .map((w) => ({ id: w.id, name: w.name, price: w.price, billing_cycle: w.billing_cycle, next_billing_date: w.next_billing_date }))
+      .map((w) => ({ id: w.id, name: w.name, price: w.price, currency: w.currency, billing_cycle: w.billing_cycle, next_billing_date: w.next_billing_date }))
       .sort((a, b) => a.next_billing_date.localeCompare(b.next_billing_date));
   }
   if (P.clients_manage || P.finance_edit) {
@@ -985,8 +1031,73 @@ api.get('/dashboard', auth, (req, res) => {
     out.onboarding_submitted = db.prepare("SELECT COUNT(*) c FROM onboarding WHERE status = 'submitted'").get().c;
     out.clients_active = db.prepare("SELECT COUNT(*) c FROM clients WHERE status = 'active'").get().c;
   }
+  for (const ext of dashboardExtensions) Object.assign(out, ext(req.user, { t0, in7, in30, months }));
   res.json(out);
 });
+
+// ---------- currencies ----------
+api.get('/currencies', auth, (req, res) => {
+  res.json({ base: baseCurrency(), rates: db.prepare('SELECT code, rate, updated_at FROM currencies ORDER BY code').all() });
+});
+api.put('/currencies/:code', auth, adminOnly, (req, res) => {
+  const code = String(req.params.code).toUpperCase();
+  if (!/^[A-Z]{3}$/.test(code)) throw bad('Use a 3-letter currency code like USD');
+  if (code === baseCurrency()) throw bad('The base currency always has a rate of 1');
+  const rate = Number(req.body.rate);
+  if (!(rate > 0)) throw bad('Rate must be greater than 0');
+  db.prepare('INSERT INTO currencies (code, rate) VALUES (?, ?) ON CONFLICT(code) DO UPDATE SET rate = excluded.rate, updated_at = CURRENT_TIMESTAMP').run(code, rate);
+  audit(req, 'currency_rate_set', 'currency', null, `${code} = ${rate} ${baseCurrency()}`);
+  res.json({ ok: true });
+});
+api.delete('/currencies/:code', auth, adminOnly, (req, res) => {
+  db.prepare('DELETE FROM currencies WHERE code = ?').run(String(req.params.code).toUpperCase());
+  res.json({ ok: true });
+});
+
+// ---------- CSV exports ----------
+function toCsv(rows) {
+  if (!rows.length) return 'No data\r\n';
+  const cols = Object.keys(rows[0]);
+  const esc = (v) => {
+    if (v === null || v === undefined) return '';
+    let s = String(v);
+    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s; // stop spreadsheet formula injection
+    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  return [cols.join(','), ...rows.map((r) => cols.map((c) => esc(r[c])).join(','))].join('\r\n');
+}
+const EXPORTS = {
+  payments: ['finance_view', `SELECT p.date, p.type, p.amount, p.currency, p.exchange_rate, p.amount_base, p.category, p.method, p.source, c.name client, w.name website, i.number invoice, p.note
+    FROM payments p LEFT JOIN clients c ON c.id = p.client_id LEFT JOIN websites w ON w.id = p.website_id LEFT JOIN invoices i ON i.id = p.invoice_id ORDER BY p.date DESC`],
+  invoices: ['finance_view', `SELECT i.number, i.issue_date, i.due_date, i.status, i.currency, i.subtotal, i.discount, i.tax, i.total, i.exchange_rate, ROUND(i.total * i.exchange_rate, 2) total_base, i.paid_date, c.name client, w.name website
+    FROM invoices i LEFT JOIN clients c ON c.id = i.client_id LEFT JOIN websites w ON w.id = i.website_id ORDER BY i.issue_date DESC`],
+  procurements: ['finance_view', `SELECT p.type, p.item, p.vendor, p.status, p.purchase_date, p.expiry_date, p.billing_cycle, p.cost, p.cost_currency, p.price, p.price_currency, p.auto_renew, w.name website, c.name client
+    FROM procurements p LEFT JOIN websites w ON w.id = p.website_id LEFT JOIN clients c ON c.id = p.client_id ORDER BY p.expiry_date`],
+  freelance: ['finance_view', `SELECT j.title, COALESCE(e.display_name, e.official_name, j.freelancer_name) freelancer, w.name website, j.status, j.assigned_date, j.due_date, j.amount, j.currency,
+    (SELECT COALESCE(SUM(amount), 0) FROM payments p WHERE p.source = 'freelance' AND p.source_id = j.id) paid
+    FROM freelance_jobs j LEFT JOIN employees e ON e.id = j.employee_id LEFT JOIN websites w ON w.id = j.website_id ORDER BY j.id DESC`],
+  payslips: ['hr_manage', `SELECT s.month, e.employee_code, e.official_name, e.display_name, e.designation, s.working_days, s.paid_days, s.gross, s.total_deductions, s.net, s.currency, s.status, s.paid_date
+    FROM payslips s JOIN employees e ON e.id = s.employee_id ORDER BY s.month DESC, e.official_name`],
+};
+api.get('/export/:name', auth, (req, res) => {
+  const name = String(req.params.name).replace(/\.csv$/, '');
+  const ex = EXPORTS[name];
+  if (!ex) throw new HttpError(404, 'Unknown export');
+  if (!req.user.perms[ex[0]]) throw new HttpError(403, 'You do not have access to this');
+  audit(req, 'data_exported', name);
+  res.set('Content-Type', 'text/csv; charset=utf-8');
+  res.set('Content-Disposition', `attachment; filename="${name}-${today()}.csv"`);
+  res.send('﻿' + toCsv(db.prepare(ex[1]).all()));
+});
+
+// ---------- feature modules ----------
+const ctx = {
+  db, insert, update, getSettings, clean, requireFields, HttpError, bad, auth, perm, adminOnly, audit, getSite, siteFilter, safeJson,
+  today, isDate, addPeriod, daysFromNow, round2, monthlyValue, encrypt, decrypt, CYCLES, CYCLE_MONTHS,
+  baseCurrency, rateOf, toBase, recordPayment, createInvoice, computeInvoice, billingCurrency, dashboardExtensions,
+};
+require('./hr')(api, ctx);
+require('./ops')(api, ctx);
 
 // ---------- static & errors ----------
 const PUBLIC = path.join(__dirname, '..', 'public');
