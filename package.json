@@ -1,4 +1,4 @@
-{
+﻿{
   "name": "agency-vault",
   "version": "1.0.0",
   "description": "Website, password vault, client & revenue manager for agencies",
@@ -11,11 +11,14 @@
   "license": "UNLICENSED",
   "dependencies": {
     "bcryptjs": "^2.4.3",
-    "better-sqlite3": "^11.10.0",
+    "better-sqlite3": "^12.11.1",
     "express": "^4.22.3"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
-  "private": true
+  "private": true,
+  "allowScripts": {
+    "better-sqlite3@12.11.1": true
+  }
 }

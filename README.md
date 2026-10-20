@@ -1,4 +1,4 @@
-# Agency Vault
+﻿# Agency Vault
 
 A small, self-hosted admin app for agencies that manage many client websites. It keeps every website's logins, pricing, revenue, tasks, team and client details in one place.
 
@@ -29,7 +29,7 @@ A small, self-hosted admin app for agencies that manage many client websites. It
 
 ## Run it
 
-Requires Node.js 18+.
+Requires Node.js 20+ (LTS recommended: https://nodejs.org).
 
 ```bash
 npm install
@@ -57,7 +57,7 @@ npm test   # end-to-end smoke test on a throwaway database
 - **Back up `data/vault.key` (or your `VAULT_KEY`) separately from the database.** Without it, stored passwords can't be decrypted. Anyone who has both the database and the key can read every password.
 - In production, put the app behind HTTPS (for example Nginx + Let's Encrypt) and set `COOKIE_SECURE=true` and `TRUST_PROXY=true`.
 - Back up the `data/` folder regularly.
-- Password reset links are printed to the server log (no mail server is configured). The simplest path is for an admin to use **Team → Reset password**.
+- Password reset links are printed to the server log (no mail server is configured). The simplest path is for an admin to use **Team â†’ Reset password**.
 
 ## Tech
 
