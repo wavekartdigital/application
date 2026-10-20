@@ -72,10 +72,20 @@ ln -sf /etc/nginx/sites-available/agency-vault /etc/nginx/sites-enabled/agency-v
 rm -f /etc/nginx/sites-enabled/default
 nginx -t && systemctl reload nginx
 
-echo "==> Firewall: allowing SSH and web traffic only"
-ufw allow OpenSSH >/dev/null
-ufw allow 'Nginx Full' >/dev/null
-ufw --force enable >/dev/null
+if [ -f /etc/iptables/rules.v4 ] && grep -q REJECT /etc/iptables/rules.v4; then
+  # Oracle Cloud Ubuntu images ship iptables rules that reject everything except SSH: open 80/443 there.
+  echo "==> Firewall (Oracle Cloud image): opening ports 80 and 443"
+  for p in 80 443; do
+    iptables -C INPUT -m state --state NEW -p tcp --dport $p -j ACCEPT 2>/dev/null || iptables -I INPUT 6 -m state --state NEW -p tcp --dport $p -j ACCEPT
+  done
+  netfilter-persistent save >/dev/null 2>&1 || iptables-save > /etc/iptables/rules.v4
+else
+  echo "==> Firewall: allowing SSH and web traffic only"
+  apt-get install -y ufw >/dev/null
+  ufw allow OpenSSH >/dev/null
+  ufw allow 'Nginx Full' >/dev/null
+  ufw --force enable >/dev/null
+fi
 
 if [ -n "$DOMAIN" ]; then
   echo "==> Getting a free SSL certificate for $DOMAIN (certbot will ask for your email and agreement)"
